@@ -1,0 +1,4 @@
+boto3==1.35.80
+flask==3.1.0
+python-dotenv==1.0.1
+amazon-transcribe==0.6.2
