@@ -4,8 +4,9 @@ A Python API using Flask, AWS Transcribe for audio transcription, and Google Gem
 
 ## Features
 
-- **Two transcription modes:**
-  - **Streaming mode** (`/transcribe`) - Real-time PCM/WAV transcription, no S3 required
+- **Three transcription modes:**
+  - **Standard streaming** (`/transcribe`) - Real-time PCM/WAV transcription, returns full transcript at once, no S3 required
+  - **SSE streaming** (`/transcribe-stream`) - Real-time PCM/WAV transcription with **progressive results** via Server-Sent Events, no S3 required
   - **Batch mode** (`/transcribe-batch`) - Support for multiple audio formats via S3, with timing metrics
 - **AI-powered summarization with Google Gemini 2.5 Flash:**
   - **Summary only** (`/summarize-transcript`) - Summarize existing transcripts
@@ -98,7 +99,95 @@ response = requests.post(url, files=files, data=data)
 print(response.json())
 ```
 
-#### Option 2: Batch Mode (Multiple formats, requires S3)
+#### Option 2: Streaming Mode with Real-Time Results (PCM/WAV only, no S3 required)
+
+Get transcription results **as they are generated** using Server-Sent Events (SSE):
+
+Using curl (with real-time streaming):
+
+```bash
+curl -X POST http://localhost:5001/transcribe-stream \
+  -F "file=@/path/to/your/audio.wav" \
+  -F "language_code=en-US" \
+  --no-buffer
+```
+
+Using Python with SSE client:
+
+```python
+import requests
+
+url = "http://localhost:5001/transcribe-stream"
+files = {"file": open("audio.wav", "rb")}
+data = {"language_code": "en-US"}
+
+# Stream the response
+response = requests.post(url, files=files, data=data, stream=True)
+
+for line in response.iter_lines():
+    if line:
+        line = line.decode('utf-8')
+        if line.startswith('data: '):
+            import json
+            data = json.loads(line[6:])  # Remove 'data: ' prefix
+
+            if data.get('done'):
+                print("\n✓ Transcription complete!")
+                break
+            else:
+                # Print partial or final results in real-time
+                marker = "🔄" if data.get('is_partial') else "✓"
+                print(f"{marker} {data['text']}")
+```
+
+Using JavaScript in browser:
+
+```javascript
+const formData = new FormData();
+formData.append('file', audioFile);
+formData.append('language_code', 'en-US');
+
+const eventSource = await fetch('http://localhost:5001/transcribe-stream', {
+    method: 'POST',
+    body: formData
+});
+
+const reader = eventSource.body.getReader();
+const decoder = new TextDecoder();
+
+while (true) {
+    const {done, value} = await reader.read();
+    if (done) break;
+
+    const chunk = decoder.decode(value);
+    const lines = chunk.split('\n');
+
+    for (const line of lines) {
+        if (line.startsWith('data: ')) {
+            const data = JSON.parse(line.substring(6));
+
+            if (data.done) {
+                console.log('✓ Transcription complete!');
+            } else {
+                console.log(data.is_partial ? '🔄' : '✓', data.text);
+            }
+        }
+    }
+}
+```
+
+**Response format (SSE):**
+```
+data: {"text": "hello", "is_partial": true}
+
+data: {"text": "hello world", "is_partial": false}
+
+data: {"text": "how are you", "is_partial": false}
+
+data: {"done": true}
+```
+
+#### Option 3: Batch Mode (Multiple formats, requires S3)
 
 Using curl:
 
@@ -121,7 +210,7 @@ response = requests.post(url, files=files, data=data)
 print(response.json())
 ```
 
-#### Option 3: Summarize Transcript (Text summarization only)
+#### Option 4: Summarize Transcript (Text summarization only)
 
 Using curl with JSON:
 
@@ -165,7 +254,7 @@ response = requests.post(url, json=data)
 print(response.json())
 ```
 
-#### Option 4: Transcribe and Summarize (Combined - audio to summary)
+#### Option 5: Transcribe and Summarize (Combined - audio to summary)
 
 Using curl:
 
@@ -308,6 +397,44 @@ Transcribe an audio file using real-time streaming API. **No S3 bucket required.
 
 ---
 
+### `POST /transcribe-stream` (SSE Streaming Mode)
+
+Transcribe an audio file using real-time streaming API with **progressive results** via Server-Sent Events. **No S3 bucket required.**
+
+**Supported Formats**: PCM/WAV only
+
+**Parameters:**
+- `file` (required): Audio file to transcribe (WAV/PCM format)
+- `language_code` (optional): Language code, defaults to `en-US`
+
+**Returns (Server-Sent Events):**
+- Stream of events in SSE format
+- Each event contains: `{"text": "...", "is_partial": true/false}`
+- Final event: `{"done": true}`
+
+**Response format:**
+```
+data: {"text": "partial text", "is_partial": true}
+
+data: {"text": "final text for phrase", "is_partial": false}
+
+data: {"done": true}
+```
+
+**Processing**:
+- Files are temporarily saved locally and deleted after transcription
+- Results are streamed in real-time as AWS Transcribe generates them
+- Partial results show intermediate recognition (may change)
+- Final results are confirmed and won't change
+
+**Use cases:**
+- Real-time transcription display
+- Live captioning
+- Interactive voice applications
+- Progress feedback for long audio files
+
+---
+
 ### `POST /transcribe-batch` (Batch Mode)
 
 Transcribe an audio file using AWS Transcribe batch API with S3 storage. **Requires S3 bucket.**
@@ -444,10 +571,18 @@ Health check endpoint.
 - Transcription jobs are automatically cleaned up after completion
 
 ### Which endpoint to use?
-- **Use streaming mode** (`/transcribe`) for:
-  - Quick, real-time transcription
+- **Use standard streaming mode** (`/transcribe`) for:
+  - Quick, real-time transcription with single response
   - WAV/PCM files
   - When you don't want to set up S3
+  - Simple use cases where you just need the final transcript
+
+- **Use SSE streaming mode** (`/transcribe-stream`) for:
+  - Real-time progressive transcription results
+  - Live captioning or interactive applications
+  - WAV/PCM files
+  - When you want to show transcription progress to users
+  - No S3 setup required
 
 - **Use batch mode** (`/transcribe-batch`) for:
   - MP3, MP4, and other compressed audio formats

@@ -5,7 +5,7 @@ import time
 import json
 import urllib.request
 from pathlib import Path
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from amazon_transcribe.client import TranscribeStreamingClient
 from amazon_transcribe.handlers import TranscriptResultStreamHandler
 from amazon_transcribe.model import TranscriptEvent
@@ -82,6 +82,23 @@ class MyEventHandler(TranscriptResultStreamHandler):
                     self.transcript_parts.append(alt.transcript)
 
 
+class StreamingEventHandler(TranscriptResultStreamHandler):
+    """Event handler that streams transcription results to a queue for real-time SSE"""
+    def __init__(self, transcript_result_stream, result_queue):
+        super().__init__(transcript_result_stream)
+        self.result_queue = result_queue
+
+    async def handle_transcript_event(self, transcript_event: TranscriptEvent):
+        results = transcript_event.transcript.results
+        for result in results:
+            for alt in result.alternatives:
+                # Put both partial and final results in the queue
+                await self.result_queue.put({
+                    'text': alt.transcript,
+                    'is_partial': result.is_partial
+                })
+
+
 async def transcribe_file_async(audio_file_path, language_code='en-US'):
     """
     Async function to transcribe audio using AWS Transcribe Streaming API
@@ -124,6 +141,121 @@ async def write_chunks(stream, audio_stream):
     async for chunk in audio_stream:
         await stream.input_stream.send_audio_event(audio_chunk=chunk)
     await stream.input_stream.end_stream()
+
+
+async def transcribe_file_streaming(audio_file_path, language_code, result_queue):
+    """
+    Async function to transcribe audio with streaming results sent to a queue.
+    This enables real-time Server-Sent Events (SSE) to clients.
+    """
+    client = TranscribeStreamingClient(region=os.getenv('AWS_REGION', 'us-east-1'))
+
+    # Read audio file
+    async def audio_stream():
+        with open(audio_file_path, 'rb') as audio_file:
+            chunk_size = 1024 * 8  # 8KB chunks
+            while True:
+                chunk = audio_file.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+                await asyncio.sleep(0.01)  # Small delay to simulate streaming
+
+    # Start streaming transcription
+    stream = await client.start_stream_transcription(
+        language_code=language_code,
+        media_sample_rate_hz=16000,
+        media_encoding='pcm',
+    )
+
+    # Create streaming event handler
+    handler = StreamingEventHandler(stream.output_stream, result_queue)
+
+    try:
+        # Send audio and handle events concurrently
+        await asyncio.gather(
+            write_chunks(stream, audio_stream()),
+            handler.handle_events()
+        )
+    finally:
+        # Signal completion
+        await result_queue.put({'done': True})
+
+
+@app.route('/transcribe-stream', methods=['POST'])
+def transcribe_audio_stream():
+    """
+    Streaming endpoint that returns real-time transcription results via Server-Sent Events (SSE).
+    Accepts audio file upload and streams transcription text as it's generated.
+    """
+    temp_file_path = None
+
+    try:
+        # Check if file is present
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file provided'}), 400
+
+        file = request.files['file']
+
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+
+        # Save file temporarily to local disk
+        temp_filename = f"audio_{uuid.uuid4()}{os.path.splitext(file.filename)[1]}"
+        temp_file_path = os.path.join(TEMP_DIR, temp_filename)
+        file.save(temp_file_path)
+
+        # Get language code from request
+        language_code = request.form.get('language_code', 'en-US')
+
+        # Generator function for SSE streaming
+        def generate():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            # Create async queue for streaming results (must be in same event loop)
+            result_queue = asyncio.Queue()
+
+            # Start transcription in background
+            transcription_task = loop.create_task(
+                transcribe_file_streaming(temp_file_path, language_code, result_queue)
+            )
+
+            try:
+                while True:
+                    # Get result from queue (blocking)
+                    result = loop.run_until_complete(result_queue.get())
+
+                    # Send SSE formatted data
+                    yield f"data: {json.dumps(result)}\n\n"
+
+                    # Check if transcription is complete
+                    if result.get('done'):
+                        break
+            finally:
+                # Wait for transcription task to finish
+                loop.run_until_complete(transcription_task)
+                loop.close()
+
+                # Clean up temp file
+                if temp_file_path and os.path.exists(temp_file_path):
+                    os.remove(temp_file_path)
+
+        return Response(
+            stream_with_context(generate()),
+            mimetype='text/event-stream',
+            headers={
+                'Cache-Control': 'no-cache',
+                'X-Accel-Buffering': 'no'  # Disable nginx buffering
+            }
+        )
+
+    except Exception as e:
+        # Clean up temp file on error
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/transcribe', methods=['POST'])
