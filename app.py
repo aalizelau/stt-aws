@@ -226,8 +226,8 @@ def transcribe_audio_stream():
                     # Get result from queue (blocking)
                     result = loop.run_until_complete(result_queue.get())
 
-                    # Send SSE formatted data
-                    yield f"data: {json.dumps(result)}\n\n"
+                    # Send SSE formatted data with readable unicode (ensure_ascii=False)
+                    yield f"data: {json.dumps(result, ensure_ascii=False)}\n\n"
 
                     # Check if transcription is complete
                     if result.get('done'):
@@ -243,10 +243,11 @@ def transcribe_audio_stream():
 
         return Response(
             stream_with_context(generate()),
-            mimetype='text/event-stream',
+            mimetype='text/event-stream; charset=utf-8',
             headers={
                 'Cache-Control': 'no-cache',
-                'X-Accel-Buffering': 'no'  # Disable nginx buffering
+                'X-Accel-Buffering': 'no',  # Disable nginx buffering
+                'Content-Type': 'text/event-stream; charset=utf-8'
             }
         )
 
