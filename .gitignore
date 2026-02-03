@@ -48,3 +48,5 @@ Thumbs.db
 # *.wav
 # *.flac
 # *.mp4
+
+/temp
