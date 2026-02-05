@@ -11,7 +11,6 @@ A Python API using Flask, AWS Transcribe for audio transcription, and Google Gem
   - **Batch mode** (`/transcribe-batch`) - Support for multiple audio formats via S3, with timing metrics
 - **AI-powered summarization with Google Gemini 2.5 Flash:**
   - **Summary only** (`/summarize-transcript`) - Summarize existing transcripts
-  - **Combined** (`/transcribe-and-summarize`) - Transcribe audio and generate summary in one call
 - Automatic cleanup of temporary files and S3 objects
 - Simple REST API interface
 - Support for multiple languages (transcription and summarization)
@@ -22,9 +21,9 @@ A Python API using Flask, AWS Transcribe for audio transcription, and Google Gem
 - **AWS Account** (for transcription):
   - IAM user with access to Transcribe services (Streaming API for `/transcribe`, Batch API for `/transcribe-batch`)
   - AWS credentials (Access Key ID and Secret Access Key)
-  - S3 bucket (required only for batch transcription endpoints: `/transcribe-batch` and `/transcribe-and-summarize`)
+  - S3 bucket (required for batch transcription endpoint `/transcribe-batch` and WebSocket real-time mode for audio archival)
 - **Google API Key** (for summarization):
-  - Required for `/summarize-transcript` and `/transcribe-and-summarize` endpoints
+  - Required for `/summarize-transcript` endpoint
   - Get your API key from [Google AI Studio](https://aistudio.google.com/app/apikey)
 
 ## Setup
@@ -428,42 +427,6 @@ response = requests.post(url, json=data)
 print(response.json())
 ```
 
-#### Option 5: Transcribe and Summarize (Combined - audio to summary)
-
-Using curl:
-
-```bash
-curl -X POST http://localhost:5001/transcribe-and-summarize \
-  -F "file=@/path/to/your/audio.mp3" \
-  -F "language_code=en-US"
-```
-
-With custom summary prompt:
-
-```bash
-curl -X POST http://localhost:5001/transcribe-and-summarize \
-  -F "file=@/path/to/your/audio.mp3" \
-  -F "language_code=zh-CN" \
-  -F "custom_prompt=Focus on action items and key decisions: {transcript}"
-```
-
-Using Python requests:
-
-```python
-import requests
-
-url = "http://localhost:5001/transcribe-and-summarize"
-files = {"file": open("audio.mp3", "rb")}
-data = {"language_code": "en-US"}
-
-response = requests.post(url, files=files, data=data)
-result = response.json()
-
-print("Transcript:", result['transcript'])
-print("\nSummary:", result['summary'])
-print("\nProcessing Time:", result['total_processing_time_seconds'], "seconds")
-```
-
 ### Response format
 
 Success response (streaming):
@@ -474,14 +437,14 @@ Success response (streaming):
 }
 ```
 
-Success response (batch with timing):
+Success response (batch with timing and S3 URL):
 ```json
 {
-  "success": true,
   "transcript": "This is the transcribed text from your audio file.",
   "mode": "batch",
   "upload_time_seconds": 0.34,
-  "total_processing_time_seconds": 12.56
+  "total_processing_time_seconds": 12.56,
+  "s3_url": "s3://bucket-name/audio/batch/2026-02-04/transcribe-uuid.mp3"
 }
 ```
 
@@ -490,22 +453,18 @@ Success response (summarize only):
 {
   "success": true,
   "summary": "**Overall Summary**: This transcript discusses...\n\n**Key Points**:\n- Point 1\n- Point 2\n\n**Action Items**:\n- Task 1\n- Task 2",
-  "model": "gemini-2.0-flash-exp",
+  "model": "gemini-2.5-flash",
+  "summary_language": "en",
   "transcript_length": 1523
 }
 ```
 
-Success response (transcribe and summarize):
+Success response (WebSocket realtime transcription stopped):
 ```json
 {
-  "success": true,
-  "transcript": "This is the transcribed text from your audio file.",
-  "summary": "**Overall Summary**: This transcript discusses...\n\n**Key Points**:\n- Point 1\n- Point 2",
-  "mode": "batch",
-  "model": "gemini-2.0-flash-exp",
-  "transcript_length": 1523,
-  "upload_time_seconds": 0.34,
-  "total_processing_time_seconds": 15.82
+  "status": "success",
+  "message": "Transcription session ended",
+  "s3_url": "s3://bucket-name/audio/realtime/2026-02-04/session-xyz.pcm"
 }
 ```
 
@@ -689,46 +648,6 @@ Summarize an existing transcript using Google Gemini 2.5 Flash. **Requires Googl
 
 ---
 
-### `POST /transcribe-and-summarize` (Combined)
-
-Transcribe audio and generate AI summary in one call. **Requires both S3 bucket and Google API key.**
-
-**Supported Formats**: MP3, MP4, WAV, FLAC, OGG, AMR, WebM, M4A
-
-**Parameters:**
-- `file` (required): Audio file to transcribe (any supported format)
-- `language_code` (optional): Language code, defaults to `en-US`
-- `custom_prompt` (optional): Custom prompt template for summarization
-
-**Returns:**
-- `200 OK`: Both transcription and summarization successful
-- `400 Bad Request`: Invalid file or unsupported format
-- `408 Request Timeout`: Transcription took longer than 5 minutes
-- `500 Internal Server Error`: Transcription, summarization, or S3 error
-
-**Response format**:
-```json
-{
-  "success": true,
-  "transcript": "Full transcript text",
-  "summary": "AI-generated summary",
-  "mode": "batch",
-  "model": "gemini-2.0-flash-exp",
-  "transcript_length": 1523,
-  "upload_time_seconds": 0.34,
-  "total_processing_time_seconds": 15.82
-}
-```
-
-**Processing**:
-1. File is uploaded to S3
-2. AWS Transcribe processes the audio
-3. Google Gemini generates summary from transcript
-4. S3 file and transcription job are cleaned up
-5. Returns both transcript and summary with timing metrics
-
----
-
 ### `GET /health`
 
 Health check endpoint.
@@ -751,11 +670,12 @@ Health check endpoint.
 
 ### Batch Mode (`/transcribe-batch`)
 - Uses AWS Transcribe **Batch API** for asynchronous transcription
-- Files are uploaded to S3 and automatically deleted after processing
+- Files are uploaded to S3 and **kept for archival** (not deleted after processing)
 - **Requires S3 bucket** configured in environment variables
 - Supports multiple audio formats (MP3, MP4, WAV, FLAC, OGG, AMR, WebM, M4A)
 - May take longer for processing (polls every 5 seconds, max 5 minutes timeout)
 - Transcription jobs are automatically cleaned up after completion
+- Returns S3 URL where audio is stored for future reference
 
 ### Which endpoint to use?
 - **Use WebSocket real-time streaming** for:
@@ -791,14 +711,15 @@ Health check endpoint.
 - Make sure your `.env` file exists and contains all required variables
 - For streaming mode (`/transcribe`): `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`
 - For batch mode (`/transcribe-batch`): Also requires `S3_BUCKET_NAME`
-- For summarization (`/summarize-transcript`, `/transcribe-and-summarize`): Also requires `GOOGLE_API_KEY`
+- For summarization (`/summarize-transcript`): Also requires `GOOGLE_API_KEY`
+- For WebSocket real-time mode: Also requires `S3_BUCKET_NAME` (for audio archival)
 
 **AWS credentials error:**
 - Verify your AWS credentials are correct
 - Ensure your IAM user has permissions for:
   - Amazon Transcribe Streaming API (for `/transcribe`)
-  - Amazon Transcribe Batch API (for `/transcribe-batch` and `/transcribe-and-summarize`)
-  - S3 permissions: `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` (for batch endpoints)
+  - Amazon Transcribe Batch API (for `/transcribe-batch`)
+  - S3 permissions: `s3:PutObject`, `s3:GetObject` (for batch mode and WebSocket real-time mode)
 
 **Google API key error:**
 - Get your API key from [Google AI Studio](https://aistudio.google.com/app/apikey)
@@ -813,7 +734,8 @@ Health check endpoint.
 
 **Audio format error:**
 - **Streaming endpoint** (`/transcribe`): Ensure your audio file is in PCM/WAV format with 16kHz sample rate
-- **Batch endpoints** (`/transcribe-batch`, `/transcribe-and-summarize`): Check that your file format is supported (MP3, MP4, WAV, FLAC, OGG, AMR, WebM, M4A)
+- **Batch endpoint** (`/transcribe-batch`): Check that your file format is supported (MP3, MP4, WAV, FLAC, OGG, AMR, WebM, M4A)
+- **WebSocket real-time**: Must be PCM format, 16kHz, mono, 16-bit
 - Convert unsupported formats before uploading
 
 **Timeout error (batch mode):**

@@ -105,6 +105,9 @@ class TranscriptionSession:
         self.stream = None
         self.handler = None
         self.is_active = False
+        self.audio_buffer = []  # Buffer to store all audio chunks for S3 upload
+        self.s3_key = None  # S3 key where audio will be saved
+        self.start_timestamp = time.time()  # For organizing files by date
 
     async def start(self):
         """Initialize AWS Transcribe streaming session"""
@@ -117,13 +120,53 @@ class TranscriptionSession:
         self.handler = RealtimeEventHandler(self.stream.output_stream, self.session_id)
         self.is_active = True
 
+        # Generate S3 key with date folder structure
+        from datetime import datetime
+        date_folder = datetime.fromtimestamp(self.start_timestamp).strftime('%Y-%m-%d')
+        self.s3_key = f"audio/realtime/{date_folder}/session-{self.session_id}.pcm"
+
         # Start handling events in background
         asyncio.create_task(self.handler.handle_events())
 
     async def send_audio_chunk(self, chunk):
-        """Send audio chunk to AWS Transcribe"""
+        """Send audio chunk to AWS Transcribe and buffer for S3"""
         if self.is_active and self.stream:
+            # Buffer the chunk for later S3 upload
+            self.audio_buffer.append(chunk)
+
+            # Send to AWS Transcribe for real-time transcription
             await self.stream.input_stream.send_audio_event(audio_chunk=chunk)
+
+    async def save_to_s3(self):
+        """Upload buffered audio to S3"""
+        if not self.audio_buffer:
+            print(f"No audio to save for session {self.session_id}")
+            return None
+
+        if not S3_BUCKET:
+            print(f"S3_BUCKET not configured, skipping audio save for session {self.session_id}")
+            return None
+
+        try:
+            # Combine all chunks into single audio file
+            complete_audio = b''.join(self.audio_buffer)
+
+            # Upload to S3
+            s3_client.put_object(
+                Bucket=S3_BUCKET,
+                Key=self.s3_key,
+                Body=complete_audio,
+                ContentType='audio/pcm'
+            )
+
+            s3_url = f"s3://{S3_BUCKET}/{self.s3_key}"
+            print(f"Audio saved to S3: {s3_url} ({len(complete_audio):,} bytes)")
+
+            return s3_url
+
+        except Exception as e:
+            print(f"Error saving audio to S3: {e}")
+            return None
 
     async def stop(self):
         """Close the transcription stream"""
@@ -402,10 +445,12 @@ def transcribe_audio_batch():
         if file.filename == '':
             return jsonify({'error': 'No file selected'}), 400
 
-        # Generate unique job name and S3 key
+        # Generate unique job name and S3 key with date folder
+        from datetime import datetime
+        date_folder = datetime.now().strftime('%Y-%m-%d')
         job_name = f"transcribe-{uuid.uuid4()}"
         file_extension = os.path.splitext(file.filename)[1].lstrip('.')
-        s3_key = f"audio/{job_name}.{file_extension}"
+        s3_key = f"audio/batch/{date_folder}/{job_name}.{file_extension}"
 
         # Validate file format
         supported_formats = ['mp3', 'mp4', 'wav', 'flac', 'ogg', 'amr', 'webm', 'm4a']
@@ -449,26 +494,27 @@ def transcribe_audio_batch():
 
                 transcript_text = transcript_data['results']['transcripts'][0]['transcript']
 
-                # Clean up: delete S3 file and transcription job
-                s3_client.delete_object(Bucket=S3_BUCKET, Key=s3_key)
+                # Clean up transcription job (keep S3 file for archival)
                 transcribe_client.delete_transcription_job(TranscriptionJobName=job_name)
 
                 # Calculate total processing time
                 total_time = time.time() - start_time
 
+                # Generate S3 URL
+                s3_url = f"s3://{S3_BUCKET}/{s3_key}"
+
                 return jsonify({
-                    'success': True,
                     'transcript': transcript_text,
                     'mode': 'batch',
                     'upload_time_seconds': round(upload_time, 2),
-                    'total_processing_time_seconds': round(total_time, 2)
+                    'total_processing_time_seconds': round(total_time, 2),
+                    's3_url': s3_url
                 }), 200
 
             elif status == 'FAILED':
                 failure_reason = response['TranscriptionJob'].get('FailureReason', 'Unknown error')
 
-                # Clean up S3 file
-                s3_client.delete_object(Bucket=S3_BUCKET, Key=s3_key)
+                # Note: S3 file kept even on failure for debugging
 
                 return jsonify({
                     'error': f'Transcription failed: {failure_reason}'
@@ -478,8 +524,7 @@ def transcribe_audio_batch():
             time.sleep(5)
             attempt += 1
 
-        # Timeout - clean up S3 file
-        s3_client.delete_object(Bucket=S3_BUCKET, Key=s3_key)
+        # Timeout - S3 file kept for manual inspection
 
         return jsonify({
             'error': 'Transcription timeout. Job may still be processing.'
@@ -650,142 +695,6 @@ Format your response in a clear, structured way. Respond entirely in {language_n
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/transcribe-and-summarize', methods=['POST'])
-def transcribe_and_summarize():
-    """
-    Combined endpoint: Transcribe audio using AWS Transcribe batch mode,
-    then summarize using Google Gemini 2.5 Flash.
-    Accepts audio file upload and returns both transcript and summary.
-    Supports multiple audio formats: MP3, MP4, WAV, FLAC, OGG, AMR, WebM.
-    """
-    try:
-        # Check if both services are configured
-        if not S3_BUCKET:
-            return jsonify({'error': 'S3_BUCKET_NAME not configured in environment variables'}), 500
-
-        if not GOOGLE_API_KEY:
-            return jsonify({
-                'error': 'Google Gemini API not configured. Please set GOOGLE_API_KEY in environment variables.'
-            }), 500
-
-        # Check if file is present
-        if 'file' not in request.files:
-            return jsonify({'error': 'No file provided'}), 400
-
-        file = request.files['file']
-
-        if file.filename == '':
-            return jsonify({'error': 'No file selected'}), 400
-
-        # Generate unique job name and S3 key
-        job_name = f"transcribe-{uuid.uuid4()}"
-        file_extension = os.path.splitext(file.filename)[1].lstrip('.')
-        s3_key = f"audio/{job_name}.{file_extension}"
-
-        # Validate file format
-        supported_formats = ['mp3', 'mp4', 'wav', 'flac', 'ogg', 'amr', 'webm', 'm4a']
-        if file_extension.lower() not in supported_formats:
-            return jsonify({
-                'error': f'Unsupported file format: {file_extension}. Supported formats: {", ".join(supported_formats)}'
-            }), 400
-
-        # Upload file to S3
-        s3_client.upload_fileobj(file, S3_BUCKET, s3_key)
-
-        # Start transcription job
-        file_uri = f"s3://{S3_BUCKET}/{s3_key}"
-
-        transcribe_client.start_transcription_job(
-            TranscriptionJobName=job_name,
-            Media={'MediaFileUri': file_uri},
-            MediaFormat=file_extension.lower(),
-            LanguageCode=request.form.get('language_code', 'en-US')
-        )
-
-        # Wait for transcription to complete (polling)
-        max_attempts = 60  # Maximum 5 minutes (60 * 5 seconds)
-        attempt = 0
-
-        while attempt < max_attempts:
-            response = transcribe_client.get_transcription_job(
-                TranscriptionJobName=job_name
-            )
-
-            status = response['TranscriptionJob']['TranscriptionJobStatus']
-
-            if status == 'COMPLETED':
-                # Get transcript
-                transcript_uri = response['TranscriptionJob']['Transcript']['TranscriptFileUri']
-
-                # Fetch transcript from URI
-                with urllib.request.urlopen(transcript_uri) as url:
-                    transcript_data = json.loads(url.read().decode())
-
-                transcript_text = transcript_data['results']['transcripts'][0]['transcript']
-
-                # Clean up: delete S3 file and transcription job
-                s3_client.delete_object(Bucket=S3_BUCKET, Key=s3_key)
-                transcribe_client.delete_transcription_job(TranscriptionJobName=job_name)
-
-                # Now summarize the transcript using Gemini
-                custom_prompt = request.form.get('custom_prompt')
-
-                if custom_prompt:
-                    prompt = custom_prompt.replace('{transcript}', transcript_text)
-                else:
-                    prompt = f"""Please analyze the following transcript and provide a comprehensive summary.
-
-Transcript:
-{transcript_text}
-
-Please provide:
-1. **Overall Summary**: A concise overview of the main topic and discussion (2-3 sentences)
-2. **Key Points**: List the main points discussed (bullet points)
-3. **Action Items**: Any tasks, decisions, or follow-up actions mentioned (if any)
-4. **Important Details**: Any specific dates, numbers, names, or technical details mentioned
-
-Format your response in a clear, structured way."""
-
-                # Use Gemini 2.5 Flash model
-                model = genai.GenerativeModel('gemini-2.0-flash-exp')
-
-                # Generate summary
-                gemini_response = model.generate_content(prompt)
-
-                return jsonify({
-                    'success': True,
-                    'transcript': transcript_text,
-                    'summary': gemini_response.text,
-                    'mode': 'batch',
-                    'model': 'gemini-2.0-flash-exp',
-                    'transcript_length': len(transcript_text)
-                }), 200
-
-            elif status == 'FAILED':
-                failure_reason = response['TranscriptionJob'].get('FailureReason', 'Unknown error')
-
-                # Clean up S3 file
-                s3_client.delete_object(Bucket=S3_BUCKET, Key=s3_key)
-
-                return jsonify({
-                    'error': f'Transcription failed: {failure_reason}'
-                }), 500
-
-            # Still in progress, wait before checking again
-            time.sleep(5)
-            attempt += 1
-
-        # Timeout - clean up S3 file
-        s3_client.delete_object(Bucket=S3_BUCKET, Key=s3_key)
-
-        return jsonify({
-            'error': 'Transcription timeout. Job may still be processing.'
-        }), 408
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
@@ -905,7 +814,7 @@ def handle_audio_chunk(data):
 
 @socketio.on('stop_transcription')
 def handle_stop_transcription():
-    """Stop the transcription session"""
+    """Stop the transcription session and save audio to S3"""
     try:
         session = active_sessions.get(request.sid)
 
@@ -913,21 +822,32 @@ def handle_stop_transcription():
             emit('error', {'message': 'No active transcription session'})
             return
 
-        # Stop the stream
+        # Stop the stream and save audio to S3
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
+            # Stop the transcription stream
             loop.run_until_complete(session.stop())
+
+            # Save buffered audio to S3
+            s3_url = loop.run_until_complete(session.save_to_s3())
         finally:
             loop.close()
 
         # Remove session
         del active_sessions[request.sid]
 
-        emit('transcription_stopped', {
+        # Prepare response
+        response = {
             'status': 'success',
             'message': 'Transcription session ended'
-        })
+        }
+
+        # Add S3 URL if save was successful
+        if s3_url:
+            response['s3_url'] = s3_url
+
+        emit('transcription_stopped', response)
 
         print(f"Transcription stopped for: {request.sid}")
 
