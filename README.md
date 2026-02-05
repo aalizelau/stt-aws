@@ -4,7 +4,8 @@ A Python API using Flask, AWS Transcribe for audio transcription, and Google Gem
 
 ## Features
 
-- **Three transcription modes:**
+- **Four transcription modes:**
+  - **Real-time WebSocket streaming** (WebSocket) - **NEW!** True real-time transcription from mobile apps while user is recording, bi-directional streaming, no S3 required
   - **Standard streaming** (`/transcribe`) - Real-time PCM/WAV transcription, returns full transcript at once, no S3 required
   - **SSE streaming** (`/transcribe-stream`) - Real-time PCM/WAV transcription with **progressive results** via Server-Sent Events, no S3 required
   - **Batch mode** (`/transcribe-batch`) - Support for multiple audio formats via S3, with timing metrics
@@ -74,9 +75,161 @@ python app.py
 
 The server will start on `http://localhost:5001`
 
-### Transcribe an audio file
+### Transcribe audio
 
-#### Option 1: Streaming Mode (PCM/WAV only, no S3 required)
+#### Option 1: Real-Time WebSocket Streaming (Mobile Apps - True Real-Time)
+
+**For mobile apps that need to stream audio WHILE recording** (audio chunks sent as user speaks):
+
+Using Python Socket.IO client:
+
+```python
+import socketio
+import base64
+
+# Create Socket.IO client
+sio = socketio.Client()
+
+@sio.on('connected')
+def on_connected(data):
+    print(f"Connected: {data}")
+
+@sio.on('transcription_started')
+def on_started(data):
+    print(f"Transcription started: {data}")
+    # Now start sending audio chunks
+
+@sio.on('transcription_result')
+def on_result(data):
+    # Real-time results as user speaks!
+    marker = "🔄" if data['is_partial'] else "✓"
+    print(f"{marker} {data['text']}")
+
+@sio.on('transcription_stopped')
+def on_stopped(data):
+    print(f"Stopped: {data}")
+
+@sio.on('error')
+def on_error(data):
+    print(f"Error: {data}")
+
+# Connect to server
+sio.connect('http://localhost:5001')
+
+# Start transcription session
+sio.emit('start_transcription', {'language_code': 'en-US'})
+
+# Simulate sending audio chunks (in real app, get from microphone)
+# Audio should be PCM format, 16kHz, mono, 16-bit
+import time
+with open('audio.pcm', 'rb') as f:
+    while True:
+        chunk = f.read(3200)  # ~100ms of audio at 16kHz
+        if not chunk:
+            break
+
+        # Send chunk (can send as base64 or raw bytes)
+        sio.emit('audio_chunk', {
+            'chunk': base64.b64encode(chunk).decode('utf-8')
+        })
+
+        time.sleep(0.1)  # Simulate real-time recording
+
+# Stop transcription
+sio.emit('stop_transcription')
+sio.disconnect()
+```
+
+Using JavaScript (Web):
+
+```javascript
+import io from 'socket.io-client';
+
+const socket = io('http://localhost:5001');
+
+socket.on('connected', (data) => {
+    console.log('Connected:', data);
+});
+
+socket.on('transcription_started', (data) => {
+    console.log('Started:', data);
+    // Start capturing audio from microphone
+});
+
+socket.on('transcription_result', (data) => {
+    const marker = data.is_partial ? '🔄' : '✓';
+    console.log(`${marker} ${data.text}`);
+    // Update UI with real-time transcription
+});
+
+socket.on('transcription_stopped', (data) => {
+    console.log('Stopped:', data);
+});
+
+socket.on('error', (data) => {
+    console.error('Error:', data);
+});
+
+// Start transcription
+socket.emit('start_transcription', { language_code: 'en-US' });
+
+// Get audio from microphone
+navigator.mediaDevices.getUserMedia({ audio: true })
+    .then(stream => {
+        const audioContext = new AudioContext({ sampleRate: 16000 });
+        const source = audioContext.createMediaStreamSource(stream);
+        const processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+        processor.onaudioprocess = (e) => {
+            const audioData = e.inputBuffer.getChannelData(0);
+            // Convert to PCM 16-bit
+            const pcm = new Int16Array(audioData.length);
+            for (let i = 0; i < audioData.length; i++) {
+                pcm[i] = Math.max(-32768, Math.min(32767, audioData[i] * 32768));
+            }
+
+            // Send to server
+            socket.emit('audio_chunk', {
+                chunk: btoa(String.fromCharCode(...new Uint8Array(pcm.buffer)))
+            });
+        };
+
+        source.connect(processor);
+        processor.connect(audioContext.destination);
+    });
+
+// When user stops recording
+function stopRecording() {
+    socket.emit('stop_transcription');
+}
+```
+
+**Mobile App Implementation (iOS/Android):**
+See "Mobile App Examples" section below for complete iOS Swift and Android Kotlin code.
+
+**WebSocket Events:**
+- **Client → Server:**
+  - `start_transcription` - Start new session with `{language_code: 'en-US'}`
+  - `audio_chunk` - Send audio chunk `{chunk: base64_encoded_pcm_data}`
+  - `stop_transcription` - End session
+
+- **Server → Client:**
+  - `connected` - Connection established
+  - `transcription_started` - Session ready, start sending audio
+  - `transcription_result` - Real-time result `{text: '...', is_partial: true/false}`
+  - `transcription_stopped` - Session ended
+  - `error` - Error occurred `{message: '...'}`
+
+**Audio Requirements:**
+- Format: PCM (raw, uncompressed)
+- Sample rate: 16000 Hz
+- Channels: Mono (1)
+- Bit depth: 16-bit
+- Chunk size: 100-200ms worth of audio (~3200-6400 bytes)
+
+---
+
+#### Option 2: Streaming Mode (PCM/WAV only, no S3 required)
 
 Using curl:
 
@@ -248,6 +401,27 @@ url = "http://localhost:5001/summarize-transcript"
 data = {
     "transcript": "Your transcript text here...",
     "custom_prompt": "Summarize the following transcript in 3 bullet points: {transcript}"
+}
+
+response = requests.post(url, json=data)
+print(response.json())
+```
+
+With summary language (Traditional Chinese):
+
+```bash
+curl -X POST http://localhost:5001/summarize-transcript \
+  -H "Content-Type: application/json" \
+  -d '{"transcript": "Your transcript text here...", "summary_language": "zh-HK"}'
+```
+
+```python
+import requests
+
+url = "http://localhost:5001/summarize-transcript"
+data = {
+    "transcript": "Your transcript text here...",
+    "summary_language": "zh-HK"  # Options: zh-HK, zh-CN, en
 }
 
 response = requests.post(url, json=data)
@@ -469,6 +643,10 @@ Summarize an existing transcript using Google Gemini 2.5 Flash. **Requires Googl
 
 **Parameters:**
 - `transcript` (required): The transcript text to summarize (JSON or form data)
+- `summary_language` (optional): Language code for summary output. Defaults to `en`
+  - `zh-HK` - Traditional Chinese (繁體中文)
+  - `zh-CN` - Simplified Chinese (简体中文)
+  - `en` - English
 - `custom_prompt` (optional): Custom prompt template (use `{transcript}` as placeholder)
 
 **Returns:**
@@ -481,7 +659,8 @@ Summarize an existing transcript using Google Gemini 2.5 Flash. **Requires Googl
 {
   "success": true,
   "summary": "Structured summary with key points, action items, etc.",
-  "model": "gemini-2.0-flash-exp",
+  "model": "gemini-2.5-flash",
+  "summary_language": "zh-HK",
   "transcript_length": 1523
 }
 ```
@@ -497,6 +676,14 @@ Summarize an existing transcript using Google Gemini 2.5 Flash. **Requires Googl
 {
   "transcript": "Your transcript here...",
   "custom_prompt": "Summarize in 3 bullet points: {transcript}"
+}
+```
+
+**Example with Traditional Chinese output**:
+```json
+{
+  "transcript": "Your transcript here...",
+  "summary_language": "zh-HK"
 }
 ```
 
@@ -571,6 +758,15 @@ Health check endpoint.
 - Transcription jobs are automatically cleaned up after completion
 
 ### Which endpoint to use?
+- **Use WebSocket real-time streaming** for:
+  - **Mobile apps with live recording** (iOS/Android)
+  - True real-time transcription while user is speaking
+  - Bi-directional communication (send audio, receive results simultaneously)
+  - Lowest latency transcription
+  - Interactive voice applications
+  - Live captioning during recording
+  - No file upload required, no S3 setup needed
+
 - **Use standard streaming mode** (`/transcribe`) for:
   - Quick, real-time transcription with single response
   - WAV/PCM files

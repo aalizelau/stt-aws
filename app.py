@@ -6,6 +6,7 @@ import json
 import urllib.request
 from pathlib import Path
 from flask import Flask, request, jsonify, Response, stream_with_context
+from flask_socketio import SocketIO, emit, disconnect
 from amazon_transcribe.client import TranscribeStreamingClient
 from amazon_transcribe.handlers import TranscriptResultStreamHandler
 from amazon_transcribe.model import TranscriptEvent
@@ -31,6 +32,9 @@ print("=" * 50)
 
 app = Flask(__name__)
 app.config['JSON_AS_ASCII'] = False  # Display Chinese characters properly in JSON
+
+# Initialize SocketIO for WebSocket support
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 # S3 client for batch transcription
 import boto3
@@ -66,6 +70,69 @@ else:
 # Create temp directory for uploaded files
 TEMP_DIR = 'temp'
 os.makedirs(TEMP_DIR, exist_ok=True)
+
+# Language code mappings for summary output
+SUMMARY_LANGUAGE_MAP = {
+    'zh-HK': 'Traditional Chinese (繁體中文)',
+    'zh-CN': 'Simplified Chinese (简体中文)',
+    'en': 'English'
+}
+
+# Session management for real-time transcription
+class RealtimeEventHandler(TranscriptResultStreamHandler):
+    """Event handler that emits transcription results via WebSocket"""
+    def __init__(self, transcript_result_stream, session_id):
+        super().__init__(transcript_result_stream)
+        self.session_id = session_id
+
+    async def handle_transcript_event(self, transcript_event: TranscriptEvent):
+        results = transcript_event.transcript.results
+        for result in results:
+            for alt in result.alternatives:
+                # Emit to the specific client via SocketIO
+                socketio.emit('transcription_result', {
+                    'text': alt.transcript,
+                    'is_partial': result.is_partial
+                }, room=self.session_id)
+
+
+class TranscriptionSession:
+    """Manages a real-time transcription session for a WebSocket connection"""
+    def __init__(self, session_id, language_code='en-US'):
+        self.session_id = session_id
+        self.language_code = language_code
+        self.client = None
+        self.stream = None
+        self.handler = None
+        self.is_active = False
+
+    async def start(self):
+        """Initialize AWS Transcribe streaming session"""
+        self.client = TranscribeStreamingClient(region=os.getenv('AWS_REGION', 'us-east-1'))
+        self.stream = await self.client.start_stream_transcription(
+            language_code=self.language_code,
+            media_sample_rate_hz=16000,
+            media_encoding='pcm',
+        )
+        self.handler = RealtimeEventHandler(self.stream.output_stream, self.session_id)
+        self.is_active = True
+
+        # Start handling events in background
+        asyncio.create_task(self.handler.handle_events())
+
+    async def send_audio_chunk(self, chunk):
+        """Send audio chunk to AWS Transcribe"""
+        if self.is_active and self.stream:
+            await self.stream.input_stream.send_audio_event(audio_chunk=chunk)
+
+    async def stop(self):
+        """Close the transcription stream"""
+        if self.is_active and self.stream:
+            await self.stream.input_stream.end_stream()
+            self.is_active = False
+
+# Global session storage (in production, use Redis or similar)
+active_sessions = {}
 
 
 class MyEventHandler(TranscriptResultStreamHandler):
@@ -519,6 +586,7 @@ def summarize_transcript():
     Summarize a transcript using Google Gemini 2.5 Flash.
     Accepts JSON with 'transcript' field or form data with 'transcript'.
     Optional 'custom_prompt' to customize the summarization prompt.
+    Optional 'summary_language' to specify output language (zh-HK, zh-CN, en).
     """
     try:
         # Check if Gemini is configured
@@ -532,18 +600,23 @@ def summarize_transcript():
             data = request.get_json()
             transcript = data.get('transcript')
             custom_prompt = data.get('custom_prompt')
+            summary_language = data.get('summary_language', 'en')
         else:
             transcript = request.form.get('transcript')
             custom_prompt = request.form.get('custom_prompt')
+            summary_language = request.form.get('summary_language', 'en')
 
         if not transcript:
             return jsonify({'error': 'No transcript provided'}), 400
+
+        # Get language instruction
+        language_name = SUMMARY_LANGUAGE_MAP.get(summary_language, 'English')
 
         # Build the prompt for Gemini
         if custom_prompt:
             prompt = custom_prompt.replace('{transcript}', transcript)
         else:
-            prompt = f"""Please analyze the following transcript and provide a comprehensive summary.
+            prompt = f"""Please analyze the following transcript and provide a comprehensive summary in {language_name}.
 
 Transcript:
 {transcript}
@@ -554,7 +627,7 @@ Please provide:
 3. **Action Items**: Any tasks, decisions, or follow-up actions mentioned (if any)
 4. **Important Details**: Any specific dates, numbers, names, or technical details mentioned
 
-Format your response in a clear, structured way."""
+Format your response in a clear, structured way. Respond entirely in {language_name}."""
 
         # Use Gemini 2.5 Flash model
         model = genai.GenerativeModel('gemini-2.5-flash')
@@ -562,12 +635,16 @@ Format your response in a clear, structured way."""
         # Generate summary
         response = model.generate_content(prompt)
 
-        return jsonify({
+        # Create response with explicit UTF-8 encoding for proper Unicode display
+        result = jsonify({
             'success': True,
             'summary': response.text,
             'model': 'gemini-2.5-flash',
+            'summary_language': summary_language,
             'transcript_length': len(transcript)
-        }), 200
+        })
+        result.headers['Content-Type'] = 'application/json; charset=utf-8'
+        return result, 200
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -715,6 +792,150 @@ def health_check():
     return jsonify({'status': 'healthy'}), 200
 
 
+# ============================================================================
+# WebSocket Real-Time Transcription Endpoints
+# ============================================================================
+
+@socketio.on('connect')
+def handle_connect():
+    """Handle client connection"""
+    print(f"Client connected: {request.sid}")
+    emit('connected', {'status': 'Connected to transcription server'})
+
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Handle client disconnection and cleanup"""
+    print(f"Client disconnected: {request.sid}")
+
+    # Cleanup session if exists
+    if request.sid in active_sessions:
+        session = active_sessions[request.sid]
+
+        # Run cleanup in async context
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(session.stop())
+        finally:
+            loop.close()
+
+        del active_sessions[request.sid]
+        print(f"Session cleaned up for: {request.sid}")
+
+
+@socketio.on('start_transcription')
+def handle_start_transcription(data):
+    """
+    Start a new real-time transcription session
+
+    Expected data format:
+    {
+        "language_code": "en-US"  # Optional, defaults to en-US
+    }
+    """
+    try:
+        language_code = data.get('language_code', 'en-US')
+
+        print(f"Starting transcription for {request.sid} with language: {language_code}")
+
+        # Create new session
+        session = TranscriptionSession(request.sid, language_code)
+        active_sessions[request.sid] = session
+
+        # Start AWS Transcribe stream
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(session.start())
+            emit('transcription_started', {
+                'status': 'success',
+                'message': 'Transcription session started. Send audio chunks now.',
+                'language_code': language_code
+            })
+        except Exception as e:
+            emit('error', {'message': f'Failed to start transcription: {str(e)}'})
+            if request.sid in active_sessions:
+                del active_sessions[request.sid]
+        finally:
+            # Don't close the loop - we need it for the session
+            pass
+
+    except Exception as e:
+        print(f"Error starting transcription: {e}")
+        emit('error', {'message': str(e)})
+
+
+@socketio.on('audio_chunk')
+def handle_audio_chunk(data):
+    """
+    Receive audio chunk from client and forward to AWS Transcribe
+
+    Expected data format:
+    {
+        "chunk": <base64 encoded audio data or raw bytes>
+    }
+    """
+    try:
+        session = active_sessions.get(request.sid)
+
+        if not session:
+            emit('error', {'message': 'No active transcription session. Call start_transcription first.'})
+            return
+
+        # Extract audio chunk (handle both base64 and raw bytes)
+        chunk = data.get('chunk')
+        if isinstance(chunk, str):
+            # If base64 string, decode it
+            import base64
+            chunk = base64.b64decode(chunk)
+
+        # Send chunk to AWS Transcribe
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(session.send_audio_chunk(chunk))
+        finally:
+            loop.close()
+
+    except Exception as e:
+        print(f"Error processing audio chunk: {e}")
+        emit('error', {'message': f'Failed to process audio chunk: {str(e)}'})
+
+
+@socketio.on('stop_transcription')
+def handle_stop_transcription():
+    """Stop the transcription session"""
+    try:
+        session = active_sessions.get(request.sid)
+
+        if not session:
+            emit('error', {'message': 'No active transcription session'})
+            return
+
+        # Stop the stream
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(session.stop())
+        finally:
+            loop.close()
+
+        # Remove session
+        del active_sessions[request.sid]
+
+        emit('transcription_stopped', {
+            'status': 'success',
+            'message': 'Transcription session ended'
+        })
+
+        print(f"Transcription stopped for: {request.sid}")
+
+    except Exception as e:
+        print(f"Error stopping transcription: {e}")
+        emit('error', {'message': str(e)})
+
+
 if __name__ == '__main__':
     # Validate required environment variables (S3_BUCKET_NAME removed for local processing)
     # required_vars = ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY']
@@ -724,4 +945,10 @@ if __name__ == '__main__':
     #     print(f"Error: Missing required environment variables: {', '.join(missing_vars)}")
     #     exit(1)
 
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    print("\n" + "=" * 50)
+    print("Starting Flask server with WebSocket support")
+    print("WebSocket endpoint: ws://localhost:5001/socket.io/")
+    print("=" * 50 + "\n")
+
+    # Use socketio.run instead of app.run to enable WebSocket support
+    socketio.run(app, host='0.0.0.0', port=5001, debug=True)
