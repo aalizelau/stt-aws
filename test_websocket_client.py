@@ -58,7 +58,7 @@ def on_stopped(data):
 def on_error(data):
     print(f"❌ Error: {data}")
 
-@sio.on(socketio.Client.EVENT_DISCONNECT)
+@sio.on('disconnect')
 def on_disconnect():
     print("Disconnected from server")
 
