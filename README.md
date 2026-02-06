@@ -4,11 +4,9 @@ A Python API using Flask, AWS Transcribe for audio transcription, and Google Gem
 
 ## Features
 
-- **Four transcription modes:**
-  - **Real-time WebSocket streaming** (WebSocket) - **NEW!** True real-time transcription from mobile apps while user is recording, bi-directional streaming, no S3 required
-  - **Standard streaming** (`/transcribe`) - Real-time PCM/WAV transcription, returns full transcript at once, no S3 required
-  - **SSE streaming** (`/transcribe-stream`) - Real-time PCM/WAV transcription with **progressive results** via Server-Sent Events, no S3 required
-  - **Batch mode** (`/transcribe-batch`) - Support for multiple audio formats via S3, with timing metrics
+- **Two transcription modes:**
+  - **Real-time WebSocket streaming** (WebSocket) - True real-time transcription from mobile apps while user is recording, bi-directional streaming, no S3 required
+  - **Async Batch mode** (`/transcribe-batch-async`) - Support for multiple audio formats via S3, non-blocking background processing
 - **AI-powered summarization with Google Gemini 2.5 Flash:**
   - **Summary only** (`/summarize-transcript`) - Summarize existing transcripts
 - Automatic cleanup of temporary files and S3 objects
@@ -19,9 +17,9 @@ A Python API using Flask, AWS Transcribe for audio transcription, and Google Gem
 
 - Python 3.8+
 - **AWS Account** (for transcription):
-  - IAM user with access to Transcribe services (Streaming API for `/transcribe`, Batch API for `/transcribe-batch`)
+  - IAM user with access to Transcribe services
   - AWS credentials (Access Key ID and Secret Access Key)
-  - S3 bucket (required for batch transcription endpoint `/transcribe-batch` and WebSocket real-time mode for audio archival)
+  - S3 bucket (required for batch transcription and WebSocket real-time mode for audio archival)
 - **Google API Key** (for summarization):
   - Required for `/summarize-transcript` endpoint
   - Get your API key from [Google AI Studio](https://aistudio.google.com/app/apikey)
@@ -76,135 +74,7 @@ The server will start on `http://localhost:5001`
 
 ### Transcribe audio
 
-#### Option 1: Real-Time WebSocket Streaming (Mobile Apps - True Real-Time)
-
-**For mobile apps that need to stream audio WHILE recording** (audio chunks sent as user speaks):
-
-Using Python Socket.IO client:
-
-```python
-import socketio
-import base64
-
-# Create Socket.IO client
-sio = socketio.Client()
-
-@sio.on('connected')
-def on_connected(data):
-    print(f"Connected: {data}")
-
-@sio.on('transcription_started')
-def on_started(data):
-    print(f"Transcription started: {data}")
-    # Now start sending audio chunks
-
-@sio.on('transcription_result')
-def on_result(data):
-    # Real-time results as user speaks!
-    marker = "🔄" if data['is_partial'] else "✓"
-    print(f"{marker} {data['text']}")
-
-@sio.on('transcription_stopped')
-def on_stopped(data):
-    print(f"Stopped: {data}")
-
-@sio.on('error')
-def on_error(data):
-    print(f"Error: {data}")
-
-# Connect to server
-sio.connect('http://localhost:5001')
-
-# Start transcription session
-sio.emit('start_transcription', {'language_code': 'en-US'})
-
-# Simulate sending audio chunks (in real app, get from microphone)
-# Audio should be PCM format, 16kHz, mono, 16-bit
-import time
-with open('audio.pcm', 'rb') as f:
-    while True:
-        chunk = f.read(3200)  # ~100ms of audio at 16kHz
-        if not chunk:
-            break
-
-        # Send chunk (can send as base64 or raw bytes)
-        sio.emit('audio_chunk', {
-            'chunk': base64.b64encode(chunk).decode('utf-8')
-        })
-
-        time.sleep(0.1)  # Simulate real-time recording
-
-# Stop transcription
-sio.emit('stop_transcription')
-sio.disconnect()
-```
-
-Using JavaScript (Web):
-
-```javascript
-import io from 'socket.io-client';
-
-const socket = io('http://localhost:5001');
-
-socket.on('connected', (data) => {
-    console.log('Connected:', data);
-});
-
-socket.on('transcription_started', (data) => {
-    console.log('Started:', data);
-    // Start capturing audio from microphone
-});
-
-socket.on('transcription_result', (data) => {
-    const marker = data.is_partial ? '🔄' : '✓';
-    console.log(`${marker} ${data.text}`);
-    // Update UI with real-time transcription
-});
-
-socket.on('transcription_stopped', (data) => {
-    console.log('Stopped:', data);
-});
-
-socket.on('error', (data) => {
-    console.error('Error:', data);
-});
-
-// Start transcription
-socket.emit('start_transcription', { language_code: 'en-US' });
-
-// Get audio from microphone
-navigator.mediaDevices.getUserMedia({ audio: true })
-    .then(stream => {
-        const audioContext = new AudioContext({ sampleRate: 16000 });
-        const source = audioContext.createMediaStreamSource(stream);
-        const processor = audioContext.createScriptProcessor(4096, 1, 1);
-
-        processor.onaudioprocess = (e) => {
-            const audioData = e.inputBuffer.getChannelData(0);
-            // Convert to PCM 16-bit
-            const pcm = new Int16Array(audioData.length);
-            for (let i = 0; i < audioData.length; i++) {
-                pcm[i] = Math.max(-32768, Math.min(32767, audioData[i] * 32768));
-            }
-
-            // Send to server
-            socket.emit('audio_chunk', {
-                chunk: btoa(String.fromCharCode(...new Uint8Array(pcm.buffer)))
-            });
-        };
-
-        source.connect(processor);
-        processor.connect(audioContext.destination);
-    });
-
-// When user stops recording
-function stopRecording() {
-    socket.emit('stop_transcription');
-}
-```
-
-**Mobile App Implementation (iOS/Android):**
-See "Mobile App Examples" section below for complete iOS Swift and Android Kotlin code.
+#### Option 1: Real-Time WebSocket Streaming
 
 **WebSocket Events:**
 - **Client → Server:**
@@ -228,141 +98,12 @@ See "Mobile App Examples" section below for complete iOS Swift and Android Kotli
 
 ---
 
-#### Option 2: Streaming Mode (PCM/WAV only, no S3 required)
 
-Using curl:
+#### Option 2: Async Batch Mode (Large files, multiple formats)
 
-```bash
-curl -X POST http://localhost:5001/transcribe \
-  -F "file=@/path/to/your/audio.wav" \
-  -F "language_code=en-US"
-```
+See [ASYNC_BATCH_API.md](ASYNC_BATCH_API.md) for full documentation on `/transcribe-batch-async`.
 
-Using Python requests:
-
-```python
-import requests
-
-url = "http://localhost:5001/transcribe"
-files = {"file": open("audio.wav", "rb")}
-data = {"language_code": "en-US"}
-
-response = requests.post(url, files=files, data=data)
-print(response.json())
-```
-
-#### Option 2: Streaming Mode with Real-Time Results (PCM/WAV only, no S3 required)
-
-Get transcription results **as they are generated** using Server-Sent Events (SSE):
-
-Using curl (with real-time streaming):
-
-```bash
-curl -X POST http://localhost:5001/transcribe-stream \
-  -F "file=@/path/to/your/audio.wav" \
-  -F "language_code=en-US" \
-  --no-buffer
-```
-
-Using Python with SSE client:
-
-```python
-import requests
-
-url = "http://localhost:5001/transcribe-stream"
-files = {"file": open("audio.wav", "rb")}
-data = {"language_code": "en-US"}
-
-# Stream the response
-response = requests.post(url, files=files, data=data, stream=True)
-
-for line in response.iter_lines():
-    if line:
-        line = line.decode('utf-8')
-        if line.startswith('data: '):
-            import json
-            data = json.loads(line[6:])  # Remove 'data: ' prefix
-
-            if data.get('done'):
-                print("\n✓ Transcription complete!")
-                break
-            else:
-                # Print partial or final results in real-time
-                marker = "🔄" if data.get('is_partial') else "✓"
-                print(f"{marker} {data['text']}")
-```
-
-Using JavaScript in browser:
-
-```javascript
-const formData = new FormData();
-formData.append('file', audioFile);
-formData.append('language_code', 'en-US');
-
-const eventSource = await fetch('http://localhost:5001/transcribe-stream', {
-    method: 'POST',
-    body: formData
-});
-
-const reader = eventSource.body.getReader();
-const decoder = new TextDecoder();
-
-while (true) {
-    const {done, value} = await reader.read();
-    if (done) break;
-
-    const chunk = decoder.decode(value);
-    const lines = chunk.split('\n');
-
-    for (const line of lines) {
-        if (line.startsWith('data: ')) {
-            const data = JSON.parse(line.substring(6));
-
-            if (data.done) {
-                console.log('✓ Transcription complete!');
-            } else {
-                console.log(data.is_partial ? '🔄' : '✓', data.text);
-            }
-        }
-    }
-}
-```
-
-**Response format (SSE):**
-```
-data: {"text": "hello", "is_partial": true}
-
-data: {"text": "hello world", "is_partial": false}
-
-data: {"text": "how are you", "is_partial": false}
-
-data: {"done": true}
-```
-
-#### Option 3: Batch Mode (Multiple formats, requires S3)
-
-Using curl:
-
-```bash
-curl -X POST http://localhost:5001/transcribe-batch \
-  -F "file=@/path/to/your/audio.mp3" \
-  -F "language_code=en-US"
-```
-
-Using Python requests:
-
-```python
-import requests
-
-url = "http://localhost:5001/transcribe-batch"
-files = {"file": open("audio.mp3", "rb")}
-data = {"language_code": "en-US"}
-
-response = requests.post(url, files=files, data=data)
-print(response.json())
-```
-
-#### Option 4: Summarize Transcript (Text summarization only)
+#### Option 3: Summarize Transcript (Text summarization only)
 
 Using curl with JSON:
 
@@ -437,18 +178,8 @@ Success response (streaming):
 }
 ```
 
-Success response (batch with timing and S3 URL):
-```json
-{
-  "transcript": "This is the transcribed text from your audio file.",
-  "mode": "batch",
-  "upload_time_seconds": 0.34,
-  "total_processing_time_seconds": 12.56,
-  "s3_url": "s3://bucket-name/audio/batch/2026-02-04/transcribe-uuid.mp3"
-}
-```
 
-Success response (summarize only):
+Success response (WebSocket realtime transcription stopped):
 ```json
 {
   "success": true,
@@ -477,14 +208,14 @@ Error response:
 
 ## Supported Audio Formats
 
-### Streaming Endpoint (`/transcribe`)
+### WebSocket Real-Time
 AWS Transcribe Streaming API supports **PCM audio format only**:
 - **Format**: WAV files with PCM encoding
-- **Sample Rate**: 8000, 16000, 24000, 32000, 44100, or 48000 Hz (16000 Hz recommended)
-- **Channels**: Mono or stereo audio
+- **Sample Rate**: 16000 Hz recommended
+- **Channels**: Mono (1)
 - **Bit Depth**: 16-bit
 
-### Batch Endpoint (`/transcribe-batch`)
+### Async Batch Endpoint (`/transcribe-batch-async`)
 AWS Transcribe Batch API supports **multiple audio formats**:
 - **MP3** - MPEG Audio Layer III
 - **MP4** - MPEG-4 container (audio only)
@@ -497,104 +228,7 @@ AWS Transcribe Batch API supports **multiple audio formats**:
 
 **Note**: Other formats may require conversion before transcription.
 
-## Supported Language Codes
-
-Common examples:
-- `en-US` - English (US)
-- `en-GB` - English (UK)
-- `es-ES` - Spanish (Spain)
-- `fr-FR` - French (France)
-- `de-DE` - German (Germany)
-- `zh-CN` - Chinese (Mandarin)
-
-See [AWS Transcribe documentation](https://docs.aws.amazon.com/transcribe/latest/dg/supported-languages.html) for full list.
-
 ## API Endpoints
-
-### `POST /transcribe` (Streaming Mode)
-
-Transcribe an audio file using real-time streaming API. **No S3 bucket required.**
-
-**Supported Formats**: PCM/WAV only
-
-**Parameters:**
-- `file` (required): Audio file to transcribe (WAV/PCM format)
-- `language_code` (optional): Language code, defaults to `en-US`
-
-**Returns:**
-- `200 OK`: Transcription successful
-- `400 Bad Request`: Invalid request (no file provided)
-- `500 Internal Server Error`: Transcription failed or server error
-
-**Processing**: Files are temporarily saved locally and deleted after transcription.
-
----
-
-### `POST /transcribe-stream` (SSE Streaming Mode)
-
-Transcribe an audio file using real-time streaming API with **progressive results** via Server-Sent Events. **No S3 bucket required.**
-
-**Supported Formats**: PCM/WAV only
-
-**Parameters:**
-- `file` (required): Audio file to transcribe (WAV/PCM format)
-- `language_code` (optional): Language code, defaults to `en-US`
-
-**Returns (Server-Sent Events):**
-- Stream of events in SSE format
-- Each event contains: `{"text": "...", "is_partial": true/false}`
-- Final event: `{"done": true}`
-
-**Response format:**
-```
-data: {"text": "partial text", "is_partial": true}
-
-data: {"text": "final text for phrase", "is_partial": false}
-
-data: {"done": true}
-```
-
-**Processing**:
-- Files are temporarily saved locally and deleted after transcription
-- Results are streamed in real-time as AWS Transcribe generates them
-- Partial results show intermediate recognition (may change)
-- Final results are confirmed and won't change
-
-**Use cases:**
-- Real-time transcription display
-- Live captioning
-- Interactive voice applications
-- Progress feedback for long audio files
-
----
-
-### `POST /transcribe-batch` (Batch Mode)
-
-Transcribe an audio file using AWS Transcribe batch API with S3 storage. **Requires S3 bucket.**
-
-**Supported Formats**: MP3, MP4, WAV, FLAC, OGG, AMR, WebM, M4A
-
-**Parameters:**
-- `file` (required): Audio file to transcribe (any supported format)
-- `language_code` (optional): Language code, defaults to `en-US`
-
-**Returns:**
-- `200 OK`: Transcription successful
-- `400 Bad Request`: Invalid request (no file provided or unsupported format)
-- `408 Request Timeout`: Transcription took longer than 5 minutes
-- `500 Internal Server Error`: Transcription failed, S3 error, or server error
-
-**Processing**:
-1. File is uploaded to S3
-2. Transcription job is started
-3. Server polls for completion (max 5 minutes)
-4. S3 file and transcription job are cleaned up automatically
-
-**Response includes timing metrics**:
-- `upload_time_seconds`: Time to upload file to S3
-- `total_processing_time_seconds`: Total time from request to response
-
----
 
 ### `POST /summarize-transcript` (AI Summarization)
 
@@ -630,22 +264,6 @@ Summarize an existing transcript using Google Gemini 2.5 Flash. **Requires Googl
 3. **Action Items**: Tasks and decisions mentioned
 4. **Important Details**: Dates, numbers, names, technical details
 
-**Example with custom prompt**:
-```json
-{
-  "transcript": "Your transcript here...",
-  "custom_prompt": "Summarize in 3 bullet points: {transcript}"
-}
-```
-
-**Example with Traditional Chinese output**:
-```json
-{
-  "transcript": "Your transcript here...",
-  "summary_language": "zh-HK"
-}
-```
-
 ---
 
 ### `GET /health`
@@ -658,95 +276,6 @@ Health check endpoint.
   "status": "healthy"
 }
 ```
-
-## Notes
-
-### Streaming Mode (`/transcribe`)
-- Uses AWS Transcribe **Streaming API** for real-time transcription
-- Audio files are temporarily saved to local `temp/` directory and deleted after transcription
-- **No S3 bucket required** - all processing is done locally
-- Audio is streamed to AWS in chunks for efficient processing
-- Only supports PCM/WAV format
-
-### Batch Mode (`/transcribe-batch`)
-- Uses AWS Transcribe **Batch API** for asynchronous transcription
-- Files are uploaded to S3 and **kept for archival** (not deleted after processing)
-- **Requires S3 bucket** configured in environment variables
-- Supports multiple audio formats (MP3, MP4, WAV, FLAC, OGG, AMR, WebM, M4A)
-- May take longer for processing (polls every 5 seconds, max 5 minutes timeout)
-- Transcription jobs are automatically cleaned up after completion
-- Returns S3 URL where audio is stored for future reference
-
-### Which endpoint to use?
-- **Use WebSocket real-time streaming** for:
-  - **Mobile apps with live recording** (iOS/Android)
-  - True real-time transcription while user is speaking
-  - Bi-directional communication (send audio, receive results simultaneously)
-  - Lowest latency transcription
-  - Interactive voice applications
-  - Live captioning during recording
-  - No file upload required, no S3 setup needed
-
-- **Use standard streaming mode** (`/transcribe`) for:
-  - Quick, real-time transcription with single response
-  - WAV/PCM files
-  - When you don't want to set up S3
-  - Simple use cases where you just need the final transcript
-
-- **Use SSE streaming mode** (`/transcribe-stream`) for:
-  - Real-time progressive transcription results
-  - Live captioning or interactive applications
-  - WAV/PCM files
-  - When you want to show transcription progress to users
-  - No S3 setup required
-
-- **Use batch mode** (`/transcribe-batch`) for:
-  - MP3, MP4, and other compressed audio formats
-  - Longer audio files
-  - When you already have S3 infrastructure
-
-## Troubleshooting
-
-**Missing environment variables:**
-- Make sure your `.env` file exists and contains all required variables
-- For streaming mode (`/transcribe`): `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`
-- For batch mode (`/transcribe-batch`): Also requires `S3_BUCKET_NAME`
-- For summarization (`/summarize-transcript`): Also requires `GOOGLE_API_KEY`
-- For WebSocket real-time mode: Also requires `S3_BUCKET_NAME` (for audio archival)
-
-**AWS credentials error:**
-- Verify your AWS credentials are correct
-- Ensure your IAM user has permissions for:
-  - Amazon Transcribe Streaming API (for `/transcribe`)
-  - Amazon Transcribe Batch API (for `/transcribe-batch`)
-  - S3 permissions: `s3:PutObject`, `s3:GetObject` (for batch mode and WebSocket real-time mode)
-
-**Google API key error:**
-- Get your API key from [Google AI Studio](https://aistudio.google.com/app/apikey)
-- Verify `GOOGLE_API_KEY` is set correctly in `.env` file
-- Check that the API key has access to Gemini models
-- Error message: "Google Gemini API not configured" means the key is missing
-
-**S3 bucket error (batch mode):**
-- Ensure the S3 bucket exists in your AWS account
-- Verify the bucket name in `.env` is correct
-- Check that your IAM user has S3 permissions for the bucket
-
-**Audio format error:**
-- **Streaming endpoint** (`/transcribe`): Ensure your audio file is in PCM/WAV format with 16kHz sample rate
-- **Batch endpoint** (`/transcribe-batch`): Check that your file format is supported (MP3, MP4, WAV, FLAC, OGG, AMR, WebM, M4A)
-- **WebSocket real-time**: Must be PCM format, 16kHz, mono, 16-bit
-- Convert unsupported formats before uploading
-
-**Timeout error (batch mode):**
-- Transcription jobs have a 5-minute timeout
-- For very long audio files, consider increasing `max_attempts` in the code
-- Check `total_processing_time_seconds` in response to monitor performance
-
-**Import errors:**
-- Make sure you've installed all dependencies: `pip install -r requirements.txt`
-- Activate the virtual environment before running the app
-- If you see "Cannot import google.generativeai", run `pip install google-generativeai`
 
 ## License
 

@@ -8,21 +8,11 @@ AWS Transcribe provides **asynchronous batch transcription** as a native feature
 2. Check job status at any time
 3. Retrieve results when complete
 
-This is much more scalable than the synchronous `/transcribe-batch` endpoint, which blocks the HTTP request until completion.
+
 
 ---
 
-## Comparison: Sync vs Async
 
-| Feature | `/transcribe-batch` (Sync) | `/transcribe-batch-async` (Async) |
-|---------|----------------------------|-----------------------------------|
-| **Request blocks?** | Yes (up to 5 minutes) | No (returns immediately) |
-| **Scalability** | Limited (ties up server threads) | High (non-blocking) |
-| **Client complexity** | Simple (one request) | Moderate (poll for status) |
-| **Use case** | Small files, simple clients | Large files, mobile apps, batch processing |
-| **Timeout risk** | High on slow networks | None (job runs independently) |
-
----
 
 ## API Endpoints
 
@@ -513,7 +503,7 @@ curl http://localhost:5001/transcribe-job/<job_name> | jq '.failure_reason'
 | `/transcribe-batch-async` | POST | Start async job | Job details (201) |
 | `/transcribe-job/<name>` | GET | Check job status | Status + transcript if done (200) |
 | `/transcribe-jobs` | GET | List recent jobs | Job list (200) |
-| `/transcribe-batch` | POST | Sync transcription (legacy) | Transcript (200) |
+
 
 ---
 
