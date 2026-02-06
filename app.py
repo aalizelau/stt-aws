@@ -421,12 +421,222 @@ def transcribe_audio():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/transcribe-batch-async', methods=['POST'])
+def transcribe_audio_batch_async():
+    """
+    Async batch transcription endpoint using AWS Transcribe with S3.
+    Supports multiple audio formats: MP3, MP4, WAV, FLAC, OGG, AMR, WebM.
+    Starts the transcription job and returns immediately with job details.
+    Use /transcribe-job/<job_name> to check status and retrieve results.
+    """
+    try:
+        # Check if S3 bucket is configured
+        if not S3_BUCKET:
+            return jsonify({'error': 'S3_BUCKET_NAME not configured in environment variables'}), 500
+
+        # Check if file is present
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file provided'}), 400
+
+        file = request.files['file']
+
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+
+        # Generate unique job name and S3 key with date folder
+        from datetime import datetime
+        date_folder = datetime.now().strftime('%Y-%m-%d')
+        job_name = f"transcribe-{uuid.uuid4()}"
+        file_extension = os.path.splitext(file.filename)[1].lstrip('.')
+        s3_key = f"audio/batch/{date_folder}/{job_name}.{file_extension}"
+
+        # Validate file format
+        supported_formats = ['mp3', 'mp4', 'wav', 'flac', 'ogg', 'amr', 'webm', 'm4a']
+        if file_extension.lower() not in supported_formats:
+            return jsonify({
+                'error': f'Unsupported file format: {file_extension}. Supported formats: {", ".join(supported_formats)}'
+            }), 400
+
+        # Upload file to S3
+        upload_start = time.time()
+        s3_client.upload_fileobj(file, S3_BUCKET, s3_key)
+        upload_time = time.time() - upload_start
+
+        # Start transcription job (non-blocking)
+        file_uri = f"s3://{S3_BUCKET}/{s3_key}"
+
+        response = transcribe_client.start_transcription_job(
+            TranscriptionJobName=job_name,
+            Media={'MediaFileUri': file_uri},
+            MediaFormat=file_extension.lower(),
+            LanguageCode=request.form.get('language_code', 'en-US')
+        )
+
+        # Return job details immediately
+        job_status = response['TranscriptionJob']['TranscriptionJobStatus']
+
+        return jsonify({
+            'job_name': job_name,
+            'status': job_status,
+            's3_url': file_uri,
+            'upload_time_seconds': round(upload_time, 2),
+            'language_code': request.form.get('language_code', 'en-US'),
+            'message': 'Transcription job started. Use /transcribe-job/<job_name> to check status.',
+            'status_endpoint': f'/transcribe-job/{job_name}'
+        }), 201
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/transcribe-job/<job_name>', methods=['GET'])
+def get_transcription_job_status(job_name):
+    """
+    Check the status of a transcription job and retrieve results if completed.
+
+    Returns:
+    - IN_PROGRESS: Job is still processing
+    - COMPLETED: Job finished successfully, transcript included
+    - FAILED: Job failed, failure reason included
+    """
+    try:
+        response = transcribe_client.get_transcription_job(
+            TranscriptionJobName=job_name
+        )
+
+        job = response['TranscriptionJob']
+        status = job['TranscriptionJobStatus']
+
+        result = {
+            'job_name': job_name,
+            'status': status,
+            'language_code': job.get('LanguageCode'),
+            'creation_time': job.get('CreationTime').isoformat() if job.get('CreationTime') else None,
+        }
+
+        if status == 'COMPLETED':
+            # Get transcript
+            transcript_uri = job['Transcript']['TranscriptFileUri']
+
+            # Fetch transcript from URI
+            with urllib.request.urlopen(transcript_uri) as url:
+                transcript_data = json.loads(url.read().decode())
+
+            transcript_text = transcript_data['results']['transcripts'][0]['transcript']
+
+            # Add transcript and metadata
+            result['transcript'] = transcript_text
+            result['completion_time'] = job.get('CompletionTime').isoformat() if job.get('CompletionTime') else None
+            result['media_format'] = job.get('MediaFormat')
+            result['media_sample_rate_hz'] = job.get('MediaSampleRateHertz')
+
+            # Calculate S3 URL from media URI
+            media_uri = job.get('Media', {}).get('MediaFileUri')
+            if media_uri:
+                result['s3_url'] = media_uri
+
+            return jsonify(result), 200
+
+        elif status == 'FAILED':
+            result['failure_reason'] = job.get('FailureReason', 'Unknown error')
+            return jsonify(result), 200
+
+        elif status == 'IN_PROGRESS':
+            result['start_time'] = job.get('StartTime').isoformat() if job.get('StartTime') else None
+            result['message'] = 'Transcription is still in progress. Check again in a few seconds.'
+            return jsonify(result), 200
+
+        else:
+            # Handle any other status (e.g., QUEUED)
+            result['message'] = f'Job status: {status}'
+            return jsonify(result), 200
+
+    except transcribe_client.exceptions.BadRequestException:
+        return jsonify({
+            'error': f'Job not found: {job_name}',
+            'message': 'The transcription job does not exist or has been deleted.'
+        }), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/transcribe-jobs', methods=['GET'])
+def list_transcription_jobs():
+    """
+    List recent transcription jobs with optional filtering.
+
+    Query parameters:
+    - status: Filter by status (QUEUED, IN_PROGRESS, COMPLETED, FAILED)
+    - max_results: Maximum number of jobs to return (default: 20, max: 100)
+    """
+    try:
+        # Get query parameters
+        status_filter = request.args.get('status')
+        max_results = min(int(request.args.get('max_results', 20)), 100)
+
+        # Build list_transcription_jobs parameters
+        list_params = {
+            'MaxResults': max_results
+        }
+
+        if status_filter:
+            valid_statuses = ['QUEUED', 'IN_PROGRESS', 'COMPLETED', 'FAILED']
+            if status_filter.upper() not in valid_statuses:
+                return jsonify({
+                    'error': f'Invalid status filter. Must be one of: {", ".join(valid_statuses)}'
+                }), 400
+            list_params['Status'] = status_filter.upper()
+
+        # List jobs
+        response = transcribe_client.list_transcription_jobs(**list_params)
+
+        # Format job summaries
+        jobs = []
+        for job_summary in response.get('TranscriptionJobSummaries', []):
+            job_info = {
+                'job_name': job_summary.get('TranscriptionJobName'),
+                'status': job_summary.get('TranscriptionJobStatus'),
+                'language_code': job_summary.get('LanguageCode'),
+                'creation_time': job_summary.get('CreationTime').isoformat() if job_summary.get('CreationTime') else None,
+                'start_time': job_summary.get('StartTime').isoformat() if job_summary.get('StartTime') else None,
+                'completion_time': job_summary.get('CompletionTime').isoformat() if job_summary.get('CompletionTime') else None,
+            }
+
+            # Add failure reason if failed
+            if job_summary.get('FailureReason'):
+                job_info['failure_reason'] = job_summary.get('FailureReason')
+
+            jobs.append(job_info)
+
+        result = {
+            'jobs': jobs,
+            'count': len(jobs),
+            'filters': {
+                'status': status_filter if status_filter else 'all',
+                'max_results': max_results
+            }
+        }
+
+        # Add next token if available (for pagination)
+        if 'NextToken' in response:
+            result['next_token'] = response['NextToken']
+            result['message'] = 'More results available. Use next_token parameter to fetch next page.'
+
+        return jsonify(result), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/transcribe-batch', methods=['POST'])
 def transcribe_audio_batch():
     """
     Batch transcription endpoint using AWS Transcribe with S3.
     Supports multiple audio formats: MP3, MP4, WAV, FLAC, OGG, AMR, WebM.
     Accepts audio file upload and returns transcription text.
+
+    NOTE: This is a synchronous endpoint that waits for completion.
+    For async behavior, use /transcribe-batch-async instead.
     """
     # Start timing
     start_time = time.time()
