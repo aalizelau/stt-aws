@@ -364,7 +364,7 @@ sox input.mp3 -r 16000 -c 1 -b 16 -e signed-integer output.pcm
 
 ```javascript
 // Browser console
-const socket = io('http://localhost:5001');
+const socket = io('http://44.223.62.169:5001');
 socket.on('connected', console.log);
 socket.on('transcription_result', console.log);
 socket.emit('start_transcription', {language_code: 'en-US'});

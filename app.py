@@ -759,7 +759,7 @@ if __name__ == '__main__':
 
     print("\n" + "=" * 50)
     print("Starting Flask server with WebSocket support")
-    print("WebSocket endpoint: ws://localhost:5001/socket.io/")
+    print("WebSocket endpoint: ws://44.223.62.169:5001/socket.io/")
     print("=" * 50 + "\n")
 
     # Use socketio.run instead of app.run to enable WebSocket support

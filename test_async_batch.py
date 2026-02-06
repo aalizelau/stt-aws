@@ -13,7 +13,7 @@ import time
 import sys
 
 
-def test_async_batch_transcription(audio_file_path, language_code='en-US', base_url='http://localhost:5001'):
+def test_async_batch_transcription(audio_file_path, language_code='en-US', base_url='http://44.223.62.169:5001'):
     """Test async batch transcription workflow"""
 
     print("=" * 60)
@@ -104,7 +104,7 @@ def test_async_batch_transcription(audio_file_path, language_code='en-US', base_
     print(f"   Check manually at: {base_url}/transcribe-job/{job_name}")
 
 
-def test_list_jobs(base_url='http://localhost:5001'):
+def test_list_jobs(base_url='http://44.223.62.169:5001'):
     """Test listing transcription jobs"""
 
     print("\n" + "=" * 60)

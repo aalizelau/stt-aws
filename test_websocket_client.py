@@ -122,7 +122,7 @@ def main():
     audio_file = sys.argv[1]
     language_code = sys.argv[2] if len(sys.argv) > 2 else 'en-US'
 
-    server_url = 'http://localhost:5001'
+    server_url = 'http://44.223.62.169:5001'
 
     print("=" * 60)
     print("WebSocket Real-Time Transcription Test Client")
