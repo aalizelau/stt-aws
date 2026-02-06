@@ -59,6 +59,37 @@ S3_BUCKET = os.getenv('S3_BUCKET_NAME')
 # AWS Transcribe client for batch jobs
 transcribe_client = boto3.client('transcribe', **aws_config)
 
+
+# Helper function to convert S3 URLs to browser-accessible HTTPS URLs
+def s3_to_https_url(s3_url, region=None):
+    """
+    Convert s3:// URL to browser-accessible HTTPS URL.
+
+    Example:
+        s3://bucket/path/file.mp3 -> https://bucket.s3.us-east-1.amazonaws.com/path/file.mp3
+
+    Args:
+        s3_url: S3 URL in format s3://bucket/key
+        region: AWS region (defaults to AWS_REGION env var)
+
+    Returns:
+        HTTPS URL that can be opened in browsers
+    """
+    if not s3_url or not s3_url.startswith('s3://'):
+        return s3_url
+
+    # Get region from parameter or environment
+    if region is None:
+        region = os.getenv('AWS_REGION', 'us-east-1')
+
+    # Parse s3://bucket/path/to/file
+    parts = s3_url[5:].split('/', 1)  # Remove 's3://' prefix
+    bucket = parts[0]
+    key = parts[1] if len(parts) > 1 else ''
+
+    # Return HTTPS URL
+    return f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
+
 # Configure Google Gemini API
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
 if GOOGLE_API_KEY:
@@ -478,7 +509,7 @@ def transcribe_audio_batch_async():
         return jsonify({
             'job_name': job_name,
             'status': job_status,
-            's3_url': file_uri,
+            'audio_url': s3_to_https_url(file_uri),
             'upload_time_seconds': round(upload_time, 2),
             'language_code': request.form.get('language_code', 'en-US'),
             'message': 'Transcription job started. Use /transcribe-job/<job_name> to check status.',
@@ -530,10 +561,10 @@ def get_transcription_job_status(job_name):
             result['media_format'] = job.get('MediaFormat')
             result['media_sample_rate_hz'] = job.get('MediaSampleRateHertz')
 
-            # Calculate S3 URL from media URI
+            # Get audio URL from media URI and convert to HTTPS
             media_uri = job.get('Media', {}).get('MediaFileUri')
             if media_uri:
-                result['s3_url'] = media_uri
+                result['audio_url'] = s3_to_https_url(media_uri)
 
             return jsonify(result), 200
 
@@ -710,15 +741,16 @@ def transcribe_audio_batch():
                 # Calculate total processing time
                 total_time = time.time() - start_time
 
-                # Generate S3 URL
+                # Generate audio URL (HTTPS format)
                 s3_url = f"s3://{S3_BUCKET}/{s3_key}"
+                audio_url = s3_to_https_url(s3_url)
 
                 return jsonify({
                     'transcript': transcript_text,
                     'mode': 'batch',
                     'upload_time_seconds': round(upload_time, 2),
                     'total_processing_time_seconds': round(total_time, 2),
-                    's3_url': s3_url
+                    'audio_url': audio_url
                 }), 200
 
             elif status == 'FAILED':
@@ -1053,9 +1085,9 @@ def handle_stop_transcription():
             'message': 'Transcription session ended'
         }
 
-        # Add S3 URL if save was successful
+        # Add audio URL if save was successful (convert to HTTPS)
         if s3_url:
-            response['s3_url'] = s3_url
+            response['audio_url'] = s3_to_https_url(s3_url)
 
         emit('transcription_stopped', response)
 
